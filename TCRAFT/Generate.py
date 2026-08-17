@@ -13,6 +13,7 @@ from Bio.SeqUtils import gc_fraction
 from tqdm import tqdm
 import os
 import argparse
+import csv
 import importlib.resources as pkg_resources
 
 """
@@ -352,142 +353,198 @@ def create_CDR3_oligo(trav_name, trbv_name, cdr3a, cdr3b, traj_name, trbj_name):
     return concatenate_oligo(oligo_frags), trbv_set #to split Step1 pools
 
 
-def generate_cdr3_oligos(input_csv_path, output_dir=None, clonotype_id_column=None):
+# PADDING FUNCTIONS
+TYPE_IIS_PADDING_SITES={"SapI":["GCTCTTC","GAAGAGC"],"BsaI":["GGTCTC","GAGACC"],"BbsI":["GAAGAC","GTCTTC"],"BsmBI":["CGTCTC","GAGACG"]}
+
+def _find_sites(seq,site):
+    seq,site=seq.upper(),site.upper(); positions=[]; start=0
+    while True:
+        pos=seq.find(site,start)
+        if pos<0: return positions
+        positions.append(pos); start=pos+1
+
+def _scan_padding_sites(seq):
+    result={}
+    for enzyme,sites in TYPE_IIS_PADDING_SITES.items():
+        for site in sites:
+            positions=_find_sites(seq,site)
+            if positions: result.setdefault(enzyme,{})[site]=positions
+    return result
+
+def _find_homopolymers(seq,min_length=5):
+    result=[]; seq=seq.upper()
+    for base in "ACGT":
+        start=0; site=base*min_length
+        while True:
+            pos=seq.find(site,start)
+            if pos<0: break
+            result.append((base,pos)); start=pos+1
+    return result
+
+def _new_padding_sites(original,padded,left_len):
+    new=[]; original_len=len(original)
+    for enzyme,sites in _scan_padding_sites(padded).items():
+        for site,positions in sites.items():
+            original_positions=set(_find_sites(original,site)); site_len=len(site)
+            for pos in positions:
+                original_pos=pos-left_len
+                if original_pos>=0 and original_pos+site_len<=original_len:
+                    if original_pos not in original_positions: new.append((enzyme,site,pos,"original_region"))
+                else:
+                    location="left_padding_or_junction" if pos<left_len else "right_padding_or_junction" if pos>=left_len+original_len else "junction"
+                    new.append((enzyme,site,pos,location))
+    return new
+
+def _new_padding_homopolymers(original,padded,left_len):
+    new=[]; original_len=len(original); original_positions={(b,p) for b,p in _find_homopolymers(original)}
+    for base,pos in _find_homopolymers(padded):
+        original_pos=pos-left_len
+        if original_pos>=0 and original_pos+5<=original_len:
+            if (base,original_pos) not in original_positions: new.append((base,pos,"original_region"))
+        else:
+            location="left_padding_or_junction" if pos<left_len else "right_padding_or_junction" if pos>=left_len+original_len else "junction"
+            new.append((base,pos,location))
+    return new
+
+def _find_safe_padding(original,target,random_seq):
+    needed=target-len(original)
+    if needed<=0: return "",original,[],[]
+    if needed>len(random_seq):
+        raise ValueError(f"Need {needed} nt of padding but random sequence contains only {len(random_seq)} nt.")
+
+    padding=random_seq[:needed]
+    padded=original+padding
+
+    sites=_new_padding_sites(original,padded,0)
+    homos=_new_padding_homopolymers(original,padded,0)
+
+    if not sites and not homos:
+        return padding,padded,sites,homos
+
+    raise RuntimeError(
+        f"No Type-IIS- and homopolymer-safe 3' padding found for "
+        f"{needed} nt of padding."
+    )
+
+
+def _pad_pool_table(df,random_seq):
+    df=df.copy()
+    target=df['Sequence'].str.len().max()
+
+    for idx,row in df.iterrows():
+        original=str(row['Sequence'])
+        needed=target-len(original)
+
+        if needed==0:
+            continue
+
+        padding,padded,sites,homos=_find_safe_padding(
+            original,target,random_seq
+        )
+
+        df.at[idx,'Sequence']=padded
+        df.at[idx,'Length']=len(padded)
+        df.at[idx,'GC']=gc_fraction(padded)
+
+    return df
+
+def _save_padded_tables(output_dir,random_sequence_file):
+    if not os.path.exists(random_sequence_file): raise FileNotFoundError(f'Random sequence file not found: {random_sequence_file}')
+    with open(random_sequence_file,'r') as f: random_seq="".join(f.read().split()).upper()
+    if set(random_seq)-set("ACGT"): raise ValueError(f'Invalid characters in random sequence: {set(random_seq)-set("ACGT")}')
+    files=['Under350_PoolA_CDR3_oligos.csv','Over350_PoolA_CDR3_oligos.csv','Under350_PoolB_CDR3_oligos.csv','Over350_PoolB_CDR3_oligos.csv']
+    for filename in files:
+        path=os.path.join(output_dir,filename)
+        if not os.path.exists(path): continue
+        df=pd.read_csv(path)
+        padded=_pad_pool_table(df,random_seq)
+        padded.to_csv(os.path.join(output_dir,filename.replace('.csv','_padded.csv')),index=False)
+        print(f'Padded {filename}: target={padded["Sequence"].str.len().max()} bp')
+
+
+def generate_cdr3_oligos(input_csv_path, output_dir=None, clonotype_id_column=None, random_sequence_file="random_1000nt.txt"):
     """
     Main function to generate CDR3 oligos from TCR information.
-
     params:
-        input_csv_path: str
-            Path to the input CSV file containing TCR information.
-
-        output_dir: str
-            Path to the output directory to save generated oligos.
-            Default is './TCRAFT-generate_<date>'.
-
-        clonotype_id_column: str or None
-            Optional name of the column containing clonotype IDs.
-            If provided, this column is carried through to all output
-            oligo tables.
-
+        input_csv_path: str, path to the input CSV file containing TCR information.
+        output_dir: str, path to the output directory to save generated oligos.
+                    Default is './TCRAFT-generate_<date>'
+    
     return:
         None, outputs files to the output directory.
     """
-
-    # PREPARE INPUTS
-    if not os.path.exists(input_csv_path):
-        raise FileNotFoundError(f'Input CSV file {input_csv_path} not found.')
-
-    if not input_csv_path.endswith('.csv'):
-        raise ValueError('Input file must be a CSV file.')
-
-    if output_dir is None:
-        date_str = pd.Timestamp.now().strftime('%Y%m%d')
-        output_dir = os.path.join(
-            os.getcwd(),
-            f"TCRAFT-generate_{date_str}"
-        )
-
-    tcr_list = pd.read_csv(input_csv_path)
-
-    required_columns = [
-        'V_alpha',
-        'V_beta',
-        'CDR3_alpha',
-        'CDR3_beta',
-        'J_alpha',
-        'J_beta'
-    ]
-
-    for col in required_columns:
-        if col not in tcr_list.columns:
-            raise ValueError(
-                f'Input CSV must contain the following columns: '
-                f'{", ".join(required_columns)}'
-            )
-
-    # ---------------------------------------------------------
-    # OPTIONAL CLONOTYPE ID COLUMN
-    # ---------------------------------------------------------
-    if clonotype_id_column is not None:
-
-        if clonotype_id_column not in tcr_list.columns:
-            raise ValueError(
-                f'Clonotype ID column "{clonotype_id_column}" '
-                f'was not found in the input CSV.'
-            )
-
-        input_columns = [clonotype_id_column] + required_columns
-
-    else:
-        input_columns = required_columns
-
-    tcr_list = tcr_list[input_columns]
-    tcr_list = tcr_list.dropna()
-
+    
     print('*******************')
     print('* TCRAFT-generate *')
     print('*******************')
     print()
-    print('Generating CDR3 oligos...')
 
-    # MAIN LOOP - GENERATE CDR3 OLIGOS
-    invalid_cdr3_num = 0
+    #PREPARE INPUTS
+    if not os.path.exists(input_csv_path):
+        raise FileNotFoundError(f'Input CSV file {input_csv_path} not found.')
+    
+    if not input_csv_path.endswith('.csv'):
+        raise ValueError('Input file must be a CSV file.')
+    
+    if output_dir is None:
+        date_str = pd.Timestamp.now().strftime('%Y%m%d')
+        output_dir = os.path.join(os.getcwd(), f"TCRAFT-generate_{date_str}")
 
-    cdr3_oligo_list = {
-        'TRAV': [],
-        'TRBV': [],
-        'CDR3A': [],
-        'CDR3B': [],
-        'TRAJ': [],
-        'TRBJ': [],
-        'Length': [],
-        'GC': [],
-        'Pool': [],
-        'Sequence': []
-    }
+    print('Loading TCRs and deduplicating...')
 
-    invalid_cdr3_oligo_list = {
-        'TRAV': [],
-        'TRBV': [],
-        'CDR3A': [],
-        'CDR3B': [],
-        'TRAJ': [],
-        'TRBJ': [],
-        'Issue': []
-    }
+    tcr_list = pd.read_csv(input_csv_path)
+    required_columns = ['V_alpha', 'V_beta', 'CDR3_alpha', 'CDR3_beta', 'J_alpha', 'J_beta']
+    
+    # VDJ duplicate groups
+    dup = tcr_list.duplicated(required_columns, keep=False)
+    grp = tcr_list.groupby(required_columns, dropna=False).ngroup() + 1
+    first = ~tcr_list.duplicated(required_columns, keep="first")
 
-    # Add clonotype ID to output dictionaries if requested
+    # Status + kept clonotype
+    tcr_list["dedup_status"] = "unique"
+    tcr_list.loc[dup & ~first, "dedup_status"] = "removed"
+    tcr_list.loc[dup & first, "dedup_status"] = "kept"
+    tcr_list["VDJ_group"] = grp
+
+    if "clonotype" in tcr_list:
+        tcr_list["kept_clonotype"] = (tcr_list["clonotype"].where(first).groupby(grp).transform("first"))
+
+    # Outputs
+    tcr_list_kept = tcr_list[first].drop(columns=["dedup_status", "VDJ_group", "kept_clonotype"],errors="ignore")
+    tcr_list_audit = (tcr_list[dup].assign(action=lambda x: x["dedup_status"].str.upper()).sort_values(["VDJ_group", "dedup_status"]).drop(columns=["dedup_status"], errors="ignore"))
+
+    tcr_list_kept.to_csv(os.path.join(output_dir, f'All_TCR_deduplicated.csv'), index=False)
+    tcr_list_audit.to_csv(os.path.join(output_dir, f'All_TCR_removed.csv'), index=False)
+    tcr_list=tcr_list_kept.copy()
+    
+    for col in required_columns:
+        if col not in tcr_list.columns:
+            raise ValueError(f'Input CSV must contain the following columns: {", ".join(required_columns)}')
     if clonotype_id_column is not None:
+        if clonotype_id_column not in tcr_list.columns:
+            raise ValueError(f'Clonotype ID column "{clonotype_id_column}" was not found in the input CSV.')
+        input_columns=[clonotype_id_column]+required_columns
+    else:
+        input_columns=required_columns
+    tcr_list=tcr_list[input_columns].dropna()
 
-        cdr3_oligo_list = {
-            clonotype_id_column: []
-        } | cdr3_oligo_list
-
-        invalid_cdr3_oligo_list = {
-            clonotype_id_column: []
-        } | invalid_cdr3_oligo_list
+    print('Generating CDR3 oligos...')
+    
+    #MAIN LOOP - GENERATE CDR3 OLIGOS
+    invalid_cdr3_num = 0
+    cdr3_oligo_list = {'TRAV':[], 'TRBV':[], 'CDR3A':[], 'CDR3B':[], 'TRAJ':[], 'TRBJ':[], 'Length':[], 'GC':[], 'Pool':[], 'Sequence':[]}
+    invalid_cdr3_oligo_list = {'TRAV':[], 'TRBV':[], 'CDR3A':[], 'CDR3B':[], 'TRAJ':[], 'TRBJ':[], 'Issue':[]}
+    if clonotype_id_column is not None:
+        cdr3_oligo_list={clonotype_id_column:[]}|cdr3_oligo_list
+        invalid_cdr3_oligo_list={clonotype_id_column:[]}|invalid_cdr3_oligo_list
 
     for i in tqdm(range(tcr_list.shape[0])):
-
         tcr = tcr_list.iloc[i, :]
-
         try:
-
-            cdr3_oligo, pool = create_CDR3_oligo(
-                tcr['V_alpha'],
-                tcr['V_beta'],
-                tcr['CDR3_alpha'],
-                tcr['CDR3_beta'],
-                tcr['J_alpha'],
-                tcr['J_beta']
-            )
-
-            # Keep clonotype ID with the generated oligo
+            cdr3_oligo, pool = create_CDR3_oligo(tcr['V_alpha'], tcr['V_beta'], tcr['CDR3_alpha'], tcr['CDR3_beta'], tcr['J_alpha'], tcr['J_beta'])
             if clonotype_id_column is not None:
-                cdr3_oligo_list[clonotype_id_column].append(
-                    tcr[clonotype_id_column]
-                )
-
+                cdr3_oligo_list[clonotype_id_column].append(tcr[clonotype_id_column])
+        
             cdr3_oligo_list['TRAV'].append(tcr['V_alpha'])
             cdr3_oligo_list['TRBV'].append(tcr['V_beta'])
             cdr3_oligo_list['CDR3A'].append(tcr['CDR3_alpha'])
@@ -500,15 +557,11 @@ def generate_cdr3_oligos(input_csv_path, output_dir=None, clonotype_id_column=No
             cdr3_oligo_list['Sequence'].append(cdr3_oligo)
 
         except ValueError as e:
-
             print(e)
             invalid_cdr3_num += 1
-
-            # Keep clonotype ID in invalid table as well
+            
             if clonotype_id_column is not None:
-                invalid_cdr3_oligo_list[clonotype_id_column].append(
-                    tcr[clonotype_id_column]
-                )
+                invalid_cdr3_oligo_list[clonotype_id_column].append(tcr[clonotype_id_column])
 
             invalid_cdr3_oligo_list['TRAV'].append(tcr['V_alpha'])
             invalid_cdr3_oligo_list['TRBV'].append(tcr['V_beta'])
@@ -518,248 +571,70 @@ def generate_cdr3_oligos(input_csv_path, output_dir=None, clonotype_id_column=No
             invalid_cdr3_oligo_list['TRBJ'].append(tcr['J_beta'])
             invalid_cdr3_oligo_list['Issue'].append(str(e))
 
-    print(
-        f'Generated {len(cdr3_oligo_list["Sequence"])} valid CDR3 oligos.'
-    )
-
+    print(f'Generated {len(cdr3_oligo_list["Sequence"])} valid CDR3 oligos.')
     if invalid_cdr3_num > 0:
-        print(
-            f'Failed to generate {invalid_cdr3_num} CDR3 oligos, '
-            f'see log for details.'
-        )
+        print(f'Failed to generate {invalid_cdr3_num} CDR3 oligos, see log for details.')
 
-    # ---------------------------------------------------------
-    # POST-PROCESSING
-    # ---------------------------------------------------------
-
+    #POST-PROCESSING
     cdr3_oligo_list = pd.DataFrame(cdr3_oligo_list)
     invalid_cdr3_oligo_list = pd.DataFrame(invalid_cdr3_oligo_list)
-
     cdr3_oligo_list.sort_values('Pool', inplace=True)
+    over_350_num = np.sum(pd.DataFrame(cdr3_oligo_list)['Length'] > 350)
+    print(f'{over_350_num}/{cdr3_oligo_list.shape[0]} oligos ({round(100*over_350_num/cdr3_oligo_list.shape[0], 2)}%) are over 350 bp long.')
 
-    # ---------------------------------------------------------
-    # SPLIT AT 350 BP
-    # ---------------------------------------------------------
+    poolA_under350 = cdr3_oligo_list.loc[np.logical_and(cdr3_oligo_list['Pool'] == 'A', cdr3_oligo_list['Length'] <= 350)].copy()
+    poolA_over350 = cdr3_oligo_list.loc[np.logical_and(cdr3_oligo_list['Pool'] == 'A', cdr3_oligo_list['Length'] > 350)].copy()
+    poolB_under350 = cdr3_oligo_list.loc[np.logical_and(cdr3_oligo_list['Pool'] == 'B', cdr3_oligo_list['Length'] <= 350)].copy()
+    poolB_over350 = cdr3_oligo_list.loc[np.logical_and(cdr3_oligo_list['Pool'] == 'B', cdr3_oligo_list['Length'] > 350)].copy()
+    all_under350 = cdr3_oligo_list.loc[cdr3_oligo_list['Length'] <= 350].copy()
+    all_over350 = cdr3_oligo_list.loc[cdr3_oligo_list['Length'] > 350].copy()
 
-    over_350_num = np.sum(
-        cdr3_oligo_list['Length'] > 350
-    )
+    # Rebuild the combined under-350 table after padding.
+    all_under350 = cdr3_oligo_list.loc[cdr3_oligo_list['Length'] <= 350].copy()
 
-    print(
-        f'{over_350_num}/{cdr3_oligo_list.shape[0]} oligos '
-        f'({round(100 * over_350_num / cdr3_oligo_list.shape[0], 2)}%) '
-        f'are over 350 bp long.'
-    )
 
-    poolA_under350 = cdr3_oligo_list.loc[
-        np.logical_and(
-            cdr3_oligo_list['Pool'] == 'A',
-            cdr3_oligo_list['Length'] <= 350
-        )
-    ]
-
-    poolA_over350 = cdr3_oligo_list.loc[
-        np.logical_and(
-            cdr3_oligo_list['Pool'] == 'A',
-            cdr3_oligo_list['Length'] > 350
-        )
-    ]
-
-    poolB_under350 = cdr3_oligo_list.loc[
-        np.logical_and(
-            cdr3_oligo_list['Pool'] == 'B',
-            cdr3_oligo_list['Length'] <= 350
-        )
-    ]
-
-    poolB_over350 = cdr3_oligo_list.loc[
-        np.logical_and(
-            cdr3_oligo_list['Pool'] == 'B',
-            cdr3_oligo_list['Length'] > 350
-        )
-    ]
-
-    all_under350 = cdr3_oligo_list.loc[
-        cdr3_oligo_list['Length'] <= 350
-    ]
-
-    all_over350 = cdr3_oligo_list.loc[
-        cdr3_oligo_list['Length'] > 350
-    ]
-
-    # ---------------------------------------------------------
-    # SAVE OUTPUTS
-    # ---------------------------------------------------------
-
+    #SAVE OUTPUTS
     print(f'Saving output files to {output_dir}')
-
     try:
         os.mkdir(output_dir)
     except FileExistsError:
         pass
+    
+    cdr3_oligo_list.to_csv(os.path.join(output_dir, f'All_{cdr3_oligo_list.shape[0]}_CDR3_oligos.csv'), index=False)
+    invalid_cdr3_oligo_list.to_csv(os.path.join(output_dir, 'Invalid_CDR3_table.csv'), index=False)
+    
+    all_under350.to_csv(os.path.join(output_dir, f'Under350_All_CDR3_oligos.csv'), index=False)
+    all_over350.to_csv(os.path.join(output_dir, f'Over350_All_CDR3_oligos.csv'), index=False)
 
-    cdr3_oligo_list.to_csv(
-        os.path.join(
-            output_dir,
-            f'All_{cdr3_oligo_list.shape[0]}_CDR3_oligos.csv'
-        ),
-        index=False
-    )
+    poolA_under350.to_csv(os.path.join(output_dir, 'Under350_PoolA_CDR3_oligos.csv'), index=False)
+    poolB_under350.to_csv(os.path.join(output_dir, 'Under350_PoolB_CDR3_oligos.csv'), index=False)
+    poolA_over350.to_csv(os.path.join(output_dir, 'Over350_PoolA_CDR3_oligos.csv'), index=False)
+    poolB_over350.to_csv(os.path.join(output_dir, 'Over350_PoolB_CDR3_oligos.csv'), index=False)
 
-    invalid_cdr3_oligo_list.to_csv(
-        os.path.join(
-            output_dir,
-            'Invalid_CDR3_table.csv'
-        ),
-        index=False
-    )
+    # Pad each Pool A/B and Under/Over350 table independently.
+    _save_padded_tables(output_dir, random_sequence_file)
 
-    all_under350.to_csv(
-        os.path.join(
-            output_dir,
-            'Under350_All_CDR3_oligos.csv'
-        ),
-        index=False
-    )
-
-    all_over350.to_csv(
-        os.path.join(
-            output_dir,
-            'Over350_All_CDR3_oligos.csv'
-        ),
-        index=False
-    )
-
-    poolA_under350.to_csv(
-        os.path.join(
-            output_dir,
-            'Under350_PoolA_CDR3_oligos.csv'
-        ),
-        index=False
-    )
-
-    poolB_under350.to_csv(
-        os.path.join(
-            output_dir,
-            'Under350_PoolB_CDR3_oligos.csv'
-        ),
-        index=False
-    )
-
-    poolA_over350.to_csv(
-        os.path.join(
-            output_dir,
-            'Over350_PoolA_CDR3_oligos.csv'
-        ),
-        index=False
-    )
-
-    poolB_over350.to_csv(
-        os.path.join(
-            output_dir,
-            'Over350_PoolB_CDR3_oligos.csv'
-        ),
-        index=False
-    )
-
-    # ---------------------------------------------------------
-    # SAVE OLIGO POOL METADATA
-    # ---------------------------------------------------------
-
-    with open(
-        os.path.join(
-            output_dir,
-            'Oligo_Pool_Metadata.csv'
-        ),
-        'w'
-    ) as out:
-
+    #save oligo pool metadata
+    with open(os.path.join(output_dir, 'Oligo_Pool_Metadata.csv'), 'w') as out:
         out.write('Entry Name,Value\n')
 
-        out.write(
-            f'Num Oligos: Pool A Under 350bp,'
-            f'{poolA_under350.shape[0]}\n'
-        )
+        out.write(f'Num Oligos: Pool A Under 350bp,{poolA_under350.shape[0]}\n')
+        out.write(f'Num Oligos: Pool B Under 350bp,{poolB_under350.shape[0]}\n')
+        out.write(f'Num Oligos: Pool A Over 350bp,{poolA_over350.shape[0]}\n')
+        out.write(f'Num Oligos: Pool B Over 350bp,{poolB_over350.shape[0]}\n')
 
-        out.write(
-            f'Num Oligos: Pool B Under 350bp,'
-            f'{poolB_under350.shape[0]}\n'
-        )
-
-        out.write(
-            f'Num Oligos: Pool A Over 350bp,'
-            f'{poolA_over350.shape[0]}\n'
-        )
-
-        out.write(
-            f'Num Oligos: Pool B Over 350bp,'
-            f'{poolB_over350.shape[0]}\n'
-        )
-
-        out.write(
-            f'Avg Oligo Size: Pool A Under 350bp,'
-            f'{poolA_under350["Length"].mean()}\n'
-        )
-
-        out.write(
-            f'Avg Oligo Size: Pool B Under 350bp,'
-            f'{poolB_under350["Length"].mean()}\n'
-        )
-
-        out.write(
-            f'Avg Oligo Size: Pool A Over 350bp,'
-            f'{poolA_over350["Length"].mean()}\n'
-        )
-
-        out.write(
-            f'Avg Oligo Size: Pool B Over 350bp,'
-            f'{poolB_over350["Length"].mean()}\n'
-        )
-
+        out.write(f'Avg Oligo Size: Pool A Under 350bp,{poolA_under350["Length"].mean()}\n')
+        out.write(f'Avg Oligo Size: Pool B Under 350bp,{poolB_under350["Length"].mean()}\n')
+        out.write(f'Avg Oligo Size: Pool A Over 350bp,{poolA_over350["Length"].mean()}\n')        
+        out.write(f'Avg Oligo Size: Pool B Over 350bp,{poolB_over350["Length"].mean()}\n')
 
 def run_CLI():
-
-    parser = argparse.ArgumentParser(
-        description=(
-            'TCRAFT-generate: Generate CDR3 Oligos '
-            'from TCR sequence annotation data.'
-        )
-    )
-
-    parser.add_argument(
-        'input_csv_path',
-        type=str,
-        help=(
-            'Input CSV file with TCR information. '
-            'Must contain the following columns: '
-            'V_alpha, V_beta, CDR3_alpha, CDR3_beta, '
-            'J_alpha, J_beta'
-        )
-    )
-
-    parser.add_argument(
-        '--output_dir',
-        type=str,
-        help=(
-            'Directory to save output files. '
-            'Default is ./TCRAFT-generate_<date>'
-        ),
-        default=None
-    )
-
-    parser.add_argument(
-        '--clonotype_id_column',
-        type=str,
-        default=None,
-        help=(
-            'Optional name of the input CSV column containing '
-            'clonotype IDs. If provided, this column is retained '
-            'in all generated oligo tables.'
-        )
-    )
+    parser = argparse.ArgumentParser(description='TCRAFT-generate: Generate CDR3 Oligos from TCR sequence annotation data.')
+    parser.add_argument('input_csv_path', type=str, help='Input CSV file with TCR information. Must contain the following columns: V_alpha, V_beta, CDR3_alpha, CDR3_beta, J_alpha, J_beta')
+    parser.add_argument('--output_dir', type=str, help='Directory to save output files. Default is ./TCRAFT-generate_<date>', default=None)
+    parser.add_argument('--clonotype_id_column', type=str, default=None, help='Optional input CSV column containing clonotype IDs.')
     args = parser.parse_args()
+    generate_cdr3_oligos(args.input_csv_path, args.output_dir, args.clonotype_id_column, ref_dir.joinpath('random_1000nt.txt'))
     
-    generate_cdr3_oligos(args.input_csv_path,args.output_dir,args.clonotype_id_column)
-
 if __name__ == "__main__":
     run_CLI()
