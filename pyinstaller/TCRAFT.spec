@@ -96,8 +96,8 @@ if sys.platform == 'darwin':
         info_plist={
             'CFBundleName': 'TCRAFT',
             'CFBundleDisplayName': 'TCRAFT',
-            'CFBundleShortVersionString': '1.2.0',
-            'CFBundleVersion': '1.2.0',
+            'CFBundleShortVersionString': '1.2.1',
+            'CFBundleVersion': '1.2.1',
             'NSHighResolutionCapable': True,
             # The app only ever reads and writes files the user picks itself.
             'LSApplicationCategoryType': 'public.app-category.education',

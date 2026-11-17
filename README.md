@@ -130,7 +130,7 @@ The CSV table *must* contain the following columns or else TCRAFT-generate will 
     - `Assembly_Metadata.csv`: Similar to the `Oligo_Pool_Metadata.csv` file, this table contains useful statistics for experimental planning and can also be directly pasted into the TCRAFT experiment planning workbook template.
 
 ## Version
-1.2.0
+1.2.1
 
 ## Author
 [Rachit Mukkamala](mailto:rsmukk@mit.edu)
