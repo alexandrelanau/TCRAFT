@@ -40,6 +40,29 @@ jobs:
         with:
           python-version: "3.11"
 
+      # Qt links against libEGL and libGL, which the Ubuntu runners do not ship.
+      # Without them, merely importing PySide6.QtWidgets fails.
+      - name: Install Qt system libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 \
+            libgl1 \
+            libxkbcommon0 \
+            libxkbcommon-x11-0 \
+            libdbus-1-3 \
+            libfontconfig1 \
+            libxcb-cursor0 \
+            libxcb-icccm4 \
+            libxcb-image0 \
+            libxcb-keysyms1 \
+            libxcb-randr0 \
+            libxcb-render-util0 \
+            libxcb-shape0 \
+            libxcb-xinerama0 \
+            libxcb-xkb1
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -48,10 +71,28 @@ jobs:
           pip install pyinstaller
 
       - name: Check that the engine runs
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: python -c "import TCRAFT.Generate, TCRAFT.Validate, TCRAFT.gui.main_window; print('imports ok')"
 
       - name: Build
         run: pyinstaller --noconfirm pyinstaller/TCRAFT.spec
+
+      # Builds that succeed but produce an executable that cannot start, or that
+      # ships without its reference data, have happened before. Run it for real.
+      - name: Smoke-test the executable
+        shell: bash
+        run: |
+          head -n 6 Sample_TCR_List.csv > smoke.csv
+          case "$RUNNER_OS" in
+            Windows) EXE="dist/TCRAFT.exe" ;;
+            macOS)   EXE="dist/TCRAFT.app/Contents/MacOS/TCRAFT" ;;
+            *)       EXE="dist/TCRAFT" ;;
+          esac
+          "$EXE" generate smoke.csv --output_dir smoke-out
+          test -f smoke-out/Oligo_Pool_Metadata.csv
+          test -f smoke-out/All_TCR_deduplicated.csv
+          echo "The bundled executable generated oligos successfully."
 
       - name: Package (Windows)
         if: runner.os == 'Windows'

@@ -13,7 +13,7 @@ It contains everything TCRAFT needs.
 |---|---|---|
 | Windows | `TCRAFT.exe` | Windows SmartScreen may warn that the publisher is unknown: click **More info**, then **Run anyway**. |
 | macOS | `TCRAFT-macOS.zip` | Unzip it, then **right-click** `TCRAFT.app` and choose **Open**, then **Open** again. Double-clicking the first time shows a Gatekeeper warning instead. |
-| Linux | `TCRAFT-Linux` | In a terminal: `chmod +x TCRAFT-Linux`, then run it. |
+| Linux | `TCRAFT-Linux` | In a terminal: `chmod +x TCRAFT-Linux`, then run it. A desktop Linux already has what it needs; on a bare server install, add the Qt libraries first: `sudo apt install libegl1 libgl1 libxkbcommon-x11-0`. |
 
 These warnings appear because the application is not code-signed; signing requires a paid
 developer certificate. They only show up the first time.
