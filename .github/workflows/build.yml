@@ -1,0 +1,117 @@
+name: Build TCRAFT executables
+
+# Run it by hand from the Actions tab, or push a tag such as v1.2.0 to also
+# publish the three executables as a GitHub Release.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+
+  build:
+    name: Build on ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: Windows
+            artifact: TCRAFT-Windows
+          - os: macos-latest
+            label: macOS
+            artifact: TCRAFT-macOS
+          - os: ubuntu-latest
+            label: Linux
+            artifact: TCRAFT-Linux
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-gui.txt
+          pip install pyinstaller
+
+      - name: Check that the engine runs
+        run: python -c "import TCRAFT.Generate, TCRAFT.Validate, TCRAFT.gui.main_window; print('imports ok')"
+
+      - name: Build
+        run: pyinstaller --noconfirm pyinstaller/TCRAFT.spec
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          mkdir release
+          copy dist\TCRAFT.exe release\TCRAFT.exe
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir release
+          # ditto preserves the bundle structure and permissions; zip does not.
+          ditto -c -k --sequesterRsrc --keepParent dist/TCRAFT.app release/TCRAFT-macOS.zip
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir release
+          cp dist/TCRAFT release/TCRAFT
+          chmod +x release/TCRAFT
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: release/*
+          if-no-files-found: error
+
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Rename Linux binary for the release
+        run: |
+          if [ -f artifacts/TCRAFT-Linux/TCRAFT ]; then
+            mv artifacts/TCRAFT-Linux/TCRAFT artifacts/TCRAFT-Linux/TCRAFT-Linux
+          fi
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
+          body: |
+            Download the file for your system, then see the Installation section
+            of the README.
+
+            | System | File | First launch |
+            |---|---|---|
+            | Windows | `TCRAFT.exe` | SmartScreen may warn: **More info** then **Run anyway** |
+            | macOS | `TCRAFT-macOS.zip` | Unzip, then **right-click** the app and choose **Open** |
+            | Linux | `TCRAFT-Linux` | `chmod +x TCRAFT-Linux` then run it |
+
+            These executables are not code-signed.

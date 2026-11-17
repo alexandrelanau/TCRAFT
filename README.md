@@ -3,6 +3,32 @@ TCRAFT is a a scalable and cost-effective platform for pooled assembly of synthe
 
 The TCRAFT package requires prior installation of [Python](https://www.python.org/downloads/) 3.7 or higher as well as an updated version of pip.
 
+## Quick start: the TCRAFT application (no Python needed)
+
+If you do not want to install anything, download the ready-to-run application from the
+[Releases page](https://github.com/birnbaumlab/TCRAFT/releases) and double-click it.
+It contains everything TCRAFT needs.
+
+| System | File to download | First launch |
+|---|---|---|
+| Windows | `TCRAFT.exe` | Windows SmartScreen may warn that the publisher is unknown: click **More info**, then **Run anyway**. |
+| macOS | `TCRAFT-macOS.zip` | Unzip it, then **right-click** `TCRAFT.app` and choose **Open**, then **Open** again. Double-clicking the first time shows a Gatekeeper warning instead. |
+| Linux | `TCRAFT-Linux` | In a terminal: `chmod +x TCRAFT-Linux`, then run it. |
+
+These warnings appear because the application is not code-signed; signing requires a paid
+developer certificate. They only show up the first time.
+
+Using the application:
+1. **Generate oligos** tab: choose your TCR list (CSV). TCRAFT immediately shows how many TCRs
+   it read, whether the required columns are present, which column holds your clonotype names,
+   and how many duplicate TCRs it found.
+2. Adjust the options if you wish, then press **Generate CDR3 oligos**. Progress and messages
+   appear live.
+3. When it finishes, a summary lists the oligos per pool; **Open results folder** takes you to
+   the files to order.
+4. The **Validate assembly** tab checks a generated oligo file by simulating Golden Gate assembly.
+
+
 ## Installation
 
 ### Option 1: Install from GitHub
@@ -24,11 +50,14 @@ By default, pip will automatically find and install all Python packages that are
 
 `pip install numpy pandas tqdm biopython`
 
+To also get the graphical interface when installing from source, use `pip install ".[gui]"` and start it with the `TCRAFT-gui` command.
+
 TCRAFT uses the following package versions:
 - numpy>=1.26.4
 - pandas>=2.2.3
 - tqdm>=4.67.0
 - biopython>=1.84
+- PySide6>=6.8 (graphical interface only)
 
 ## How to use the TCRAFT software package
 Once installed, TCRAFT can be executed from the either the terminal or a Python script using two simple functions: TCRAFT-generate and TCRAFT-validate. TCRAFT-generate takes in a CSV-formatted list of TCR sequences to assemble and generates lists of oligonucleotide sequences to order in pooled format for the TCRAFT assembly process. TCRAFT-validate takes in the list of oligonucleotides created by TCRAFT-generate and simulates TCRAFT Golden Gate assembly of these oligos into complete TCR sequences. TCRAFT-validate then checks all of these simulated assemblies to ensure that the desired TCR sequence is correctly assembled and does not contain any errors.
@@ -62,12 +91,22 @@ The CSV table *must* contain the following columns or else TCRAFT-generate will 
 
     TCRAFT-generate creates the following output files in the output directory:
     - `All_<Number of TCRs>_CDR3_oligos.csv`: Contains all successfully generated oligos
-    - `Under300_All_CDR3_oligos.csv`: Contains only oligos with length <= 300bp (which can be ordered from suppliers such as Twist Biosciences).
-    - `Over300_All_CDR3_oligos.csv`: Contains only oligos with length > 300bp (which can be ordered from alternative suppliers such as IDT).
-    - `Under300_Pool<A or B>_CDR3_oligos.csv`: Split up the under 300bp oligos into pools that can be ordered together from an oligo pool supplier.
-    - `Over300_Pool<A or B>_CDR3_oligos.csv`: Split up the oversize >300bp oligos into pools that can be ordered together from an oligo pool supplier.
+    - `Under350_All_CDR3_oligos.csv`: Contains only oligos with length <= 350bp (which can be ordered from suppliers such as Twist Biosciences).
+    - `Over350_All_CDR3_oligos.csv`: Contains only oligos with length > 350bp (which can be ordered from alternative suppliers such as IDT).
+    - `Under350_Pool<A or B>_CDR3_oligos.csv`: Split up the under 350bp oligos into pools that can be ordered together from an oligo pool supplier.
+    - `Over350_Pool<A or B>_CDR3_oligos.csv`: Split up the oversize >350bp oligos into pools that can be ordered together from an oligo pool supplier.
     - `Oligo_Pool_Metadata.csv`: Table of oligo pool statistics which are helpful to plan out TCRAFT experimental protocols (ex: number of oligos per pool, average oligo size, etc.). This table can be directly pasted into the TCRAFT experiment planning workbook template to automatically compute resuspension volumes, mixing ratios, etc.
     - `Invalid_CDR3_Table.csv`: Contains TCRs that failed TCRAFT oligo generation. The most common reason for failure is due to specification of a V/J allele ID which is not supported by TCRAFT (TCRAFT only uses functional, coding alleles as annotated by IMGT).
+    - `Under350_Pool<A or B>_CDR3_oligos_padded.csv`: The same pool, with every oligo padded at its 3' end up to the longest oligo of that pool, so that all oligos of a pool have the same length. The padding is taken from a shared random sequence and is checked never to create a Type-IIS restriction site or a homopolymer, including at the junction. The `Padding_added` and `Padding_status` columns record what happened to each oligo.
+    - `Padding_report.csv`: Lists only the oligos that needed a padding window other than the shared one, or that could not be padded safely. Normally empty.
+    - `All_TCR_deduplicated.csv`: The list of unique TCRs actually used, with the clonotype names as they appear in the oligo tables.
+    - `All_TCR_removed.csv`: Audit trail of every duplicate TCR that was removed, together with `kept_clonotype`, the name of the clonotype that was kept in its place.
+
+    **Clonotype names.** Every oligo carries a clonotype name in every output table. TCRAFT takes it from a column of your CSV named `clonotype`, `clonotype_id`, `clone_id`, `tcr_id`, `id`, `name` and similar (the match ignores case); use `--clonotype_id_column` to name the column yourself. If your file has no such column, names `TCR_0001`, `TCR_0002`, ... are generated. If two *different* TCRs share one name, the repeats are suffixed (`name`, `name_2`, ...) and a warning is printed.
+
+    **Duplicate TCRs** are detected on the six required columns, ignoring case and surrounding or inner whitespace, so that `TRAV6 ` and `trav6` count as the same TCR. The first occurrence is kept.
+
+    **Reproducibility.** By default TCRAFT uses a fixed random seed, so the same input file always yields exactly the same oligos. Pass `--seed <number>` to try another one if a few TCRs fail to generate, or `--no_seed` for a different result on every run. The seed used is recorded in `Oligo_Pool_Metadata.csv`.
 
 3. **Validate the CDR3 oligo pools by executing one of the following:**
 
@@ -91,7 +130,7 @@ The CSV table *must* contain the following columns or else TCRAFT-generate will 
     - `Assembly_Metadata.csv`: Similar to the `Oligo_Pool_Metadata.csv` file, this table contains useful statistics for experimental planning and can also be directly pasted into the TCRAFT experiment planning workbook template.
 
 ## Version
-1.1.0
+1.2.0
 
 ## Author
 [Rachit Mukkamala](mailto:rsmukk@mit.edu)

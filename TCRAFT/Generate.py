@@ -40,7 +40,142 @@ bsa1 = oligo_components['bsa1']
 bsmb1 = oligo_components['bsmb1']
 
 
+#DEFAULTS
+#A fixed default seed makes runs reproducible: the same input CSV yields the same
+#oligos, which makes results verifiable and failures replayable.
+DEFAULT_SEED = 0
+
+
+#Column names that are recognised automatically as holding clonotype names,
+#in order of preference. The match is case-insensitive.
+CLONOTYPE_CANDIDATE_COLUMNS = [
+    'clonotype', 'clonotype_id', 'clonotype_name', 'clone_id', 'clone',
+    'tcr_id', 'tcr_name', 'id', 'name', 'sample_id', 'label',
+]
+
+#Column created when the input CSV holds no clonotype name at all.
+GENERATED_CLONOTYPE_COLUMN = 'clonotype'
+
+#Required TCR annotation columns.
+REQUIRED_COLUMNS = ['V_alpha', 'V_beta', 'CDR3_alpha', 'CDR3_beta', 'J_alpha', 'J_beta']
+
+
 #HELPER FUNCTIONS
+def detect_clonotype_column(columns):
+    """
+    Finds the column of an input CSV that holds clonotype names.
+
+    params:
+        columns: an iterable of column names, or a pandas DataFrame.
+
+    return:
+        The name of the detected column as it is spelled in the CSV, or None when
+        no candidate column is present. Required TCR annotation columns are never
+        returned.
+    """
+    if isinstance(columns, pd.DataFrame):
+        columns = columns.columns
+
+    columns = list(columns)
+    lowered = {str(col).strip().lower(): col for col in columns}
+    required = {col.lower() for col in REQUIRED_COLUMNS}
+
+    for candidate in CLONOTYPE_CANDIDATE_COLUMNS:
+        if candidate in lowered and candidate not in required:
+            return lowered[candidate]
+
+    return None
+
+
+def list_input_columns(input_csv_path):
+    """
+    Returns the column names of an input CSV without loading the whole file.
+    Used by the GUI to populate the clonotype column selector.
+    """
+    return list(pd.read_csv(input_csv_path, nrows=0).columns)
+
+
+def generate_clonotype_names(count, width=4):
+    """
+    Builds default clonotype names (TCR_0001, TCR_0002, ...) for an input CSV
+    that has no clonotype column, so that every oligo always carries a name.
+    """
+    width = max(width, len(str(count)))
+    return [f'TCR_{i + 1:0{width}d}' for i in range(count)]
+
+
+def summarize_input(input_csv_path):
+    """
+    Inspects an input CSV without generating anything, so the GUI can show the
+    user what was understood from their file before a run is started.
+
+    return:
+        A dict with: n_rows, columns, clonotype_column (detected or None),
+        missing_columns, n_duplicates, n_unique, error (None when readable).
+    """
+    summary = {'n_rows': 0, 'columns': [], 'clonotype_column': None,
+               'missing_columns': list(REQUIRED_COLUMNS), 'n_duplicates': 0,
+               'n_unique': 0, 'error': None}
+
+    try:
+        df = pd.read_csv(input_csv_path)
+    except Exception as exc:
+        summary['error'] = f'Could not read this CSV file: {exc}'
+        return summary
+
+    summary['n_rows'] = int(df.shape[0])
+    summary['columns'] = [str(c) for c in df.columns]
+    summary['clonotype_column'] = detect_clonotype_column(df)
+    summary['missing_columns'] = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+
+    if summary['missing_columns'] or df.empty:
+        return summary
+
+    # Same normalisation as the run itself, so the preview matches the result.
+    keys = pd.DataFrame({col: _normalize_tcr_field(df[col]) for col in REQUIRED_COLUMNS})
+    summary['n_duplicates'] = int(keys.duplicated(keep='first').sum())
+    summary['n_unique'] = summary['n_rows'] - summary['n_duplicates']
+
+    return summary
+
+
+def _uniquify_clonotype_names(series):
+    """
+    Makes clonotype names unique by suffixing repeats (name, name_2, name_3...).
+    Two *different* TCRs sharing a name would otherwise produce two rows with the
+    same label in the final table.
+
+    return:
+        A tuple (unique names as a Series, list of (original name, occurrences)).
+    """
+    names = series.astype(str)
+
+    repeated = names.value_counts()
+    repeated = repeated[repeated > 1]
+    collisions = [(name, int(n)) for name, n in repeated.items()]
+
+    if not collisions:
+        return names, []
+
+    # Suffixing can itself collide with an existing name, so repeat until stable.
+    for _ in range(100):
+        occurrence = names.groupby(names).cumcount()
+        if not names.duplicated().any():
+            break
+        names = names.where(occurrence == 0, names + '_' + (occurrence + 1).astype(str))
+
+    return names, collisions
+
+
+def _normalize_tcr_field(series):
+    """
+    Normalises a V/J/CDR3 column for duplicate detection: strips surrounding and
+    inner whitespace and upper-cases the value. Used only to build the duplicate
+    key; the original values are preserved in all output files.
+    """
+    return series.astype(str).str.replace(r'\s+', '', regex=True).str.upper()
+
+
 def rev_comp(seq):
     """
     Returns the reverse complement of a DNA sequence 'seq'.
@@ -406,74 +541,209 @@ def _new_padding_homopolymers(original,padded,left_len):
             new.append((base,pos,location))
     return new
 
-def _find_safe_padding(original,target,random_seq):
-    needed=target-len(original)
-    if needed<=0: return "",original,[],[]
-    if needed>len(random_seq):
+def _find_safe_padding(original, target, random_seq, preferred_offset=0):
+    """
+    Finds a 3' padding sequence that brings 'original' up to 'target' nt without
+    creating a new Type-IIS restriction site or a homopolymer (>=5 nt), neither
+    inside the padding itself nor at the junction with the end of the oligo.
+
+    The padding is always taken from the single shared random reference sequence,
+    so every oligo of a pool receives the SAME padding whenever that is safe
+    (preferred_offset, normally 0). Only when that shared padding would create a
+    site or a homopolymer for this particular oligo is the window slid along the
+    reference sequence until a safe one is found.
+
+    params:
+        original: str, the unpadded oligo sequence.
+        target: int, the desired final length in nt.
+        random_seq: str, the shared random reference sequence (ACGT only).
+        preferred_offset: int, the window offset to try first.
+
+    return:
+        A dict describing the padding, or None when no safe window exists.
+    """
+    needed = target - len(original)
+
+    if needed < 0:
+        raise ValueError(f'Oligo is {-needed} nt longer than the padding target of {target} nt.')
+
+    if needed == 0:
+        return {'padding': '', 'padded': original, 'offset': 0,
+                'needed': 0, 'status': 'not_needed'}
+
+    if needed > len(random_seq):
         raise ValueError(f"Need {needed} nt of padding but random sequence contains only {len(random_seq)} nt.")
 
-    padding=random_seq[:needed]
-    padded=original+padding
+    max_offset = len(random_seq) - needed
+    preferred_offset = min(max(preferred_offset, 0), max_offset)
 
-    sites=_new_padding_sites(original,padded,0)
-    homos=_new_padding_homopolymers(original,padded,0)
+    offsets = [preferred_offset] + [o for o in range(max_offset + 1) if o != preferred_offset]
 
-    if not sites and not homos:
-        return padding,padded,sites,homos
+    for offset in offsets:
+        padding = random_seq[offset:offset + needed]
+        padded = original + padding
 
-    raise RuntimeError(
-        f"No Type-IIS- and homopolymer-safe 3' padding found for "
-        f"{needed} nt of padding."
-    )
-
-
-def _pad_pool_table(df,random_seq):
-    df=df.copy()
-    target=df['Sequence'].str.len().max()
-
-    for idx,row in df.iterrows():
-        original=str(row['Sequence'])
-        needed=target-len(original)
-
-        if needed==0:
+        if _new_padding_sites(original, padded, 0):
+            continue
+        if _new_padding_homopolymers(original, padded, 0):
             continue
 
-        padding,padded,sites,homos=_find_safe_padding(
-            original,target,random_seq
-        )
+        return {'padding': padding, 'padded': padded, 'offset': offset, 'needed': needed,
+                'status': 'padded' if offset == preferred_offset else 'padded_shifted_window'}
 
-        df.at[idx,'Sequence']=padded
-        df.at[idx,'Length']=len(padded)
-        df.at[idx,'GC']=gc_fraction(padded)
+    return None
 
-    return df
 
-def _save_padded_tables(output_dir,random_sequence_file):
-    if not os.path.exists(random_sequence_file): raise FileNotFoundError(f'Random sequence file not found: {random_sequence_file}')
-    with open(random_sequence_file,'r') as f: random_seq="".join(f.read().split()).upper()
-    if set(random_seq)-set("ACGT"): raise ValueError(f'Invalid characters in random sequence: {set(random_seq)-set("ACGT")}')
-    files=['Under350_PoolA_CDR3_oligos.csv','Over350_PoolA_CDR3_oligos.csv','Under350_PoolB_CDR3_oligos.csv','Over350_PoolB_CDR3_oligos.csv']
+def _pad_row_label(row, clonotype_column=None):
+    """
+    Builds a human-readable label for a row of a pool table, used in the padding report.
+    """
+    if clonotype_column is not None and clonotype_column in row and pd.notna(row[clonotype_column]):
+        return str(row[clonotype_column])
+
+    detected = detect_clonotype_column(list(row.index))
+    if detected is not None and pd.notna(row[detected]):
+        return str(row[detected])
+
+    return f"{row.get('TRAV', '?')}|{row.get('CDR3A', '?')}|{row.get('TRBV', '?')}|{row.get('CDR3B', '?')}"
+
+
+def _pad_pool_table(df, random_seq, table_name='', clonotype_column=None):
+    """
+    Pads every oligo of a pool table up to the longest oligo of that same table.
+    Oligos for which no safe padding exists are left unpadded and reported; the
+    run is never aborted because of a single oligo.
+
+    return:
+        A tuple (padded dataframe, list of report rows).
+    """
+    df = df.copy()
+
+    if df.empty:
+        df['Padding_added'] = pd.Series(dtype='int64')
+        df['Padding_status'] = pd.Series(dtype='object')
+        return df, []
+
+    target = int(df['Sequence'].str.len().max())
+
+    added = []
+    statuses = []
+    report = []
+
+    for _, row in df.iterrows():
+        original = str(row['Sequence'])
+        result = _find_safe_padding(original, target, random_seq)
+
+        if result is None:
+            added.append(0)
+            statuses.append('failed_no_safe_padding')
+            report.append({'Table': table_name, 'Oligo': _pad_row_label(row, clonotype_column),
+                           'Original_length': len(original), 'Target_length': target,
+                           'Padding_needed': target - len(original), 'Padding_added': 0,
+                           'Status': 'failed_no_safe_padding'})
+            continue
+
+        added.append(result['needed'])
+        statuses.append(result['status'])
+
+        if result['status'] != 'not_needed':
+            df.loc[row.name, 'Sequence'] = result['padded']
+            df.loc[row.name, 'Length'] = len(result['padded'])
+            df.loc[row.name, 'GC'] = gc_fraction(result['padded'])
+
+        if result['status'] == 'padded_shifted_window':
+            report.append({'Table': table_name, 'Oligo': _pad_row_label(row, clonotype_column),
+                           'Original_length': len(original), 'Target_length': target,
+                           'Padding_needed': result['needed'], 'Padding_added': result['needed'],
+                           'Status': f"padded_shifted_window (offset {result['offset']})"})
+
+    df['Padding_added'] = added
+    df['Padding_status'] = statuses
+
+    return df, report
+
+
+def _save_padded_tables(output_dir, random_sequence_file, clonotype_column=None):
+    """
+    Pads each pool table independently and writes the *_padded.csv files plus a
+    Padding_report.csv listing every oligo that needed a shifted window or that
+    could not be padded safely.
+    """
+    random_sequence_file = str(random_sequence_file)
+
+    if not os.path.exists(random_sequence_file):
+        raise FileNotFoundError(f'Random sequence file not found: {random_sequence_file}')
+
+    with open(random_sequence_file, 'r') as f:
+        random_seq = "".join(f.read().split()).upper()
+
+    if set(random_seq) - set("ACGT"):
+        raise ValueError(f'Invalid characters in random sequence: {set(random_seq)-set("ACGT")}')
+
+    files = ['Under350_PoolA_CDR3_oligos.csv', 'Over350_PoolA_CDR3_oligos.csv',
+             'Under350_PoolB_CDR3_oligos.csv', 'Over350_PoolB_CDR3_oligos.csv']
+
+    full_report = []
+    failed_total = 0
+
     for filename in files:
-        path=os.path.join(output_dir,filename)
-        if not os.path.exists(path): continue
-        df=pd.read_csv(path)
-        padded=_pad_pool_table(df,random_seq)
-        padded.to_csv(os.path.join(output_dir,filename.replace('.csv','_padded.csv')),index=False)
-        print(f'Padded {filename}: target={padded["Sequence"].str.len().max()} bp')
+        path = os.path.join(output_dir, filename)
+
+        if not os.path.exists(path):
+            continue
+
+        df = pd.read_csv(path)
+
+        if df.empty:
+            continue
+
+        padded, report = _pad_pool_table(df, random_seq, table_name=filename,
+                                         clonotype_column=clonotype_column)
+        padded.to_csv(os.path.join(output_dir, filename.replace('.csv', '_padded.csv')), index=False)
+
+        full_report.extend(report)
+        failed = int((padded['Padding_status'] == 'failed_no_safe_padding').sum())
+        shifted = int((padded['Padding_status'] == 'padded_shifted_window').sum())
+        failed_total += failed
+
+        print(f'Padded {filename}: target={int(padded["Sequence"].str.len().max())} bp, '
+              f'{shifted} shifted window(s), {failed} not padded')
+
+    report_df = pd.DataFrame(full_report, columns=['Table', 'Oligo', 'Original_length', 'Target_length',
+                                                   'Padding_needed', 'Padding_added', 'Status'])
+    report_df.to_csv(os.path.join(output_dir, 'Padding_report.csv'), index=False)
+
+    if failed_total > 0:
+        print(f'Warning: {failed_total} oligo(s) could not be padded safely and were left unpadded. '
+              f'See Padding_report.csv.')
 
 
-def generate_cdr3_oligos(input_csv_path, output_dir=None, clonotype_id_column=None, random_sequence_file="random_1000nt.txt"):
+def generate_cdr3_oligos(input_csv_path, output_dir=None, clonotype_id_column=None,
+                         random_sequence_file=None, seed=DEFAULT_SEED,
+                         progress_callback=None):
     """
     Main function to generate CDR3 oligos from TCR information.
     params:
         input_csv_path: str, path to the input CSV file containing TCR information.
         output_dir: str, path to the output directory to save generated oligos.
                     Default is './TCRAFT-generate_<date>'
-    
+        clonotype_id_column: str, input CSV column holding clonotype names. When
+                    None, a known column name is auto-detected; if the CSV holds
+                    none, names TCR_0001... are generated. Every oligo therefore
+                    always carries a clonotype name in every output table.
+        random_sequence_file: path to the shared random sequence used for 3' padding.
+                    Default is the bundled TCRAFT/references/random_1000nt.txt.
+        seed: int or None, random seed. A fixed seed makes a run reproducible:
+                    the same input CSV yields the same oligos. Pass None for a
+                    non-reproducible run.
+        progress_callback: optional callable(done, total) invoked after each TCR.
+                    Used by the GUI to show real progress; when given, the tqdm
+                    progress bar is suppressed.
+
     return:
         None, outputs files to the output directory.
     """
-    
+
     print('*******************')
     print('* TCRAFT-generate *')
     print('*******************')
@@ -482,23 +752,84 @@ def generate_cdr3_oligos(input_csv_path, output_dir=None, clonotype_id_column=No
     #PREPARE INPUTS
     if not os.path.exists(input_csv_path):
         raise FileNotFoundError(f'Input CSV file {input_csv_path} not found.')
-    
+
     if not input_csv_path.endswith('.csv'):
         raise ValueError('Input file must be a CSV file.')
-    
+
+    # The padding reference ships with the package: resolve it here so that the
+    # GUI and direct imports work exactly like the CLI.
+    if random_sequence_file is None:
+        random_sequence_file = ref_dir.joinpath('random_1000nt.txt')
+
+    # A fixed seed makes codon sampling reproducible across runs.
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(int(seed) % (2 ** 32))
+        print(f'Random seed: {seed}')
+
     if output_dir is None:
         date_str = pd.Timestamp.now().strftime('%Y%m%d')
         output_dir = os.path.join(os.getcwd(), f"TCRAFT-generate_{date_str}")
 
+    # Create the output directory before anything is written into it.
+    os.makedirs(output_dir, exist_ok=True)
+
     print('Loading TCRs and deduplicating...')
 
     tcr_list = pd.read_csv(input_csv_path)
-    required_columns = ['V_alpha', 'V_beta', 'CDR3_alpha', 'CDR3_beta', 'J_alpha', 'J_beta']
-    
+    required_columns = list(REQUIRED_COLUMNS)
+
+    # Check the input columns BEFORE using them to deduplicate, so a malformed
+    # CSV produces a clear message instead of a KeyError.
+    missing_columns = [col for col in required_columns if col not in tcr_list.columns]
+    if missing_columns:
+        raise ValueError(f'Input CSV is missing the following required column(s): {", ".join(missing_columns)}. '
+                         f'Required columns are: {", ".join(required_columns)}')
+
+    # RESOLVE THE CLONOTYPE NAME COLUMN
+    # Explicit choice wins; otherwise a known column name is detected; otherwise
+    # names are generated, so that every oligo always carries a clonotype name.
+    if clonotype_id_column is not None:
+        if clonotype_id_column not in tcr_list.columns:
+            raise ValueError(f'Clonotype ID column "{clonotype_id_column}" was not found in the input CSV. '
+                             f'Available columns are: {", ".join(str(c) for c in tcr_list.columns)}')
+        print(f'Clonotype names: using column "{clonotype_id_column}".')
+
+    else:
+        detected = detect_clonotype_column(tcr_list)
+
+        if detected is not None:
+            clonotype_id_column = detected
+            print(f'Clonotype names: auto-detected column "{clonotype_id_column}".')
+
+        else:
+            clonotype_id_column = GENERATED_CLONOTYPE_COLUMN
+            tcr_list.insert(0, clonotype_id_column, generate_clonotype_names(tcr_list.shape[0]))
+            print(f'Clonotype names: no clonotype column found in the input CSV, '
+                  f'generated names TCR_0001...TCR_{tcr_list.shape[0]:04d} in column "{clonotype_id_column}".')
+
+    # Rows with no name at all would otherwise end up as 'nan' in the output.
+    unnamed = tcr_list[clonotype_id_column].isna()
+    if unnamed.any():
+        fallback = generate_clonotype_names(tcr_list.shape[0])
+        tcr_list.loc[unnamed, clonotype_id_column] = [fallback[i] for i in np.flatnonzero(unnamed)]
+        print(f'Warning: {int(unnamed.sum())} row(s) had an empty clonotype name; '
+              f'generated TCR_#### names for them.')
+
+    # Normalised copies of the VDJ columns (trimmed, upper-cased, inner whitespace
+    # removed) are used as the duplicate key, so that 'TRAV6 ' and 'trav6' are
+    # recognised as the same clonotype. The original values are left untouched in
+    # every output file.
+    key_columns = []
+    for col in required_columns:
+        key_col = f'__key_{col}'
+        tcr_list[key_col] = _normalize_tcr_field(tcr_list[col])
+        key_columns.append(key_col)
+
     # VDJ duplicate groups
-    dup = tcr_list.duplicated(required_columns, keep=False)
-    grp = tcr_list.groupby(required_columns, dropna=False).ngroup() + 1
-    first = ~tcr_list.duplicated(required_columns, keep="first")
+    dup = tcr_list.duplicated(key_columns, keep=False)
+    grp = tcr_list.groupby(key_columns, dropna=False).ngroup() + 1
+    first = ~tcr_list.duplicated(key_columns, keep="first")
 
     # Status + kept clonotype
     tcr_list["dedup_status"] = "unique"
@@ -506,27 +837,41 @@ def generate_cdr3_oligos(input_csv_path, output_dir=None, clonotype_id_column=No
     tcr_list.loc[dup & first, "dedup_status"] = "kept"
     tcr_list["VDJ_group"] = grp
 
-    if "clonotype" in tcr_list:
-        tcr_list["kept_clonotype"] = (tcr_list["clonotype"].where(first).groupby(grp).transform("first"))
+    # Every removed duplicate records the name of the clonotype that was kept in
+    # its place, so the audit file stays traceable.
+    tcr_list["kept_clonotype"] = (tcr_list[clonotype_id_column].where(first).groupby(grp).transform("first"))
 
     # Outputs
-    tcr_list_kept = tcr_list[first].drop(columns=["dedup_status", "VDJ_group", "kept_clonotype"],errors="ignore")
-    tcr_list_audit = (tcr_list[dup].assign(action=lambda x: x["dedup_status"].str.upper()).sort_values(["VDJ_group", "dedup_status"]).drop(columns=["dedup_status"], errors="ignore"))
+    helper_columns = key_columns + ["dedup_status", "VDJ_group", "kept_clonotype"]
+    tcr_list_kept = tcr_list[first].drop(columns=helper_columns, errors="ignore")
+    tcr_list_audit = (tcr_list[dup].assign(action=lambda x: x["dedup_status"].str.upper()).sort_values(["VDJ_group", "dedup_status"]).drop(columns=key_columns + ["dedup_status"], errors="ignore"))
 
-    tcr_list_kept.to_csv(os.path.join(output_dir, f'All_TCR_deduplicated.csv'), index=False)
+    removed_num = int((dup & ~first).sum())
+    print(f'Loaded {tcr_list.shape[0]} TCRs, kept {tcr_list_kept.shape[0]} unique, '
+          f'removed {removed_num} duplicate(s).')
+
+    tcr_list = tcr_list_kept.copy()
+
+    # Two DIFFERENT TCRs may still share the same clonotype name. Make the names
+    # unique so that one name means one oligo in the final tables.
+    unique_names, name_collisions = _uniquify_clonotype_names(tcr_list[clonotype_id_column])
+    tcr_list[clonotype_id_column] = unique_names
+
+    if name_collisions:
+        print(f'Warning: {len(name_collisions)} clonotype name(s) were used by several distinct TCRs '
+              f'and have been suffixed to stay unique:')
+        for name, occurrences in name_collisions[:10]:
+            print(f'  "{name}" appeared {occurrences} times -> "{name}", "{name}_2", ...')
+        if len(name_collisions) > 10:
+            print(f'  ... and {len(name_collisions) - 10} more (see All_TCR_deduplicated.csv).')
+
+    # Write the deduplicated list after the names have been made unique, so the
+    # saved table matches the names used in the oligo tables.
+    tcr_list.to_csv(os.path.join(output_dir, f'All_TCR_deduplicated.csv'), index=False)
     tcr_list_audit.to_csv(os.path.join(output_dir, f'All_TCR_removed.csv'), index=False)
-    tcr_list=tcr_list_kept.copy()
-    
-    for col in required_columns:
-        if col not in tcr_list.columns:
-            raise ValueError(f'Input CSV must contain the following columns: {", ".join(required_columns)}')
-    if clonotype_id_column is not None:
-        if clonotype_id_column not in tcr_list.columns:
-            raise ValueError(f'Clonotype ID column "{clonotype_id_column}" was not found in the input CSV.')
-        input_columns=[clonotype_id_column]+required_columns
-    else:
-        input_columns=required_columns
-    tcr_list=tcr_list[input_columns].dropna()
+
+    input_columns = [clonotype_id_column] + required_columns
+    tcr_list = tcr_list[input_columns].dropna()
 
     print('Generating CDR3 oligos...')
     
@@ -538,7 +883,9 @@ def generate_cdr3_oligos(input_csv_path, output_dir=None, clonotype_id_column=No
         cdr3_oligo_list={clonotype_id_column:[]}|cdr3_oligo_list
         invalid_cdr3_oligo_list={clonotype_id_column:[]}|invalid_cdr3_oligo_list
 
-    for i in tqdm(range(tcr_list.shape[0])):
+    total_tcrs = tcr_list.shape[0]
+
+    for i in tqdm(range(total_tcrs), disable=progress_callback is not None):
         tcr = tcr_list.iloc[i, :]
         try:
             cdr3_oligo, pool = create_CDR3_oligo(tcr['V_alpha'], tcr['V_beta'], tcr['CDR3_alpha'], tcr['CDR3_beta'], tcr['J_alpha'], tcr['J_beta'])
@@ -571,6 +918,9 @@ def generate_cdr3_oligos(input_csv_path, output_dir=None, clonotype_id_column=No
             invalid_cdr3_oligo_list['TRBJ'].append(tcr['J_beta'])
             invalid_cdr3_oligo_list['Issue'].append(str(e))
 
+        if progress_callback is not None:
+            progress_callback(i + 1, total_tcrs)
+
     print(f'Generated {len(cdr3_oligo_list["Sequence"])} valid CDR3 oligos.')
     if invalid_cdr3_num > 0:
         print(f'Failed to generate {invalid_cdr3_num} CDR3 oligos, see log for details.')
@@ -578,8 +928,13 @@ def generate_cdr3_oligos(input_csv_path, output_dir=None, clonotype_id_column=No
     #POST-PROCESSING
     cdr3_oligo_list = pd.DataFrame(cdr3_oligo_list)
     invalid_cdr3_oligo_list = pd.DataFrame(invalid_cdr3_oligo_list)
+    if cdr3_oligo_list.empty:
+        invalid_cdr3_oligo_list.to_csv(os.path.join(output_dir, 'Invalid_CDR3_table.csv'), index=False)
+        raise ValueError('No valid CDR3 oligo could be generated from this input. '
+                         f'See Invalid_CDR3_table.csv in {output_dir} for the reason of each failure.')
+
     cdr3_oligo_list.sort_values('Pool', inplace=True)
-    over_350_num = np.sum(pd.DataFrame(cdr3_oligo_list)['Length'] > 350)
+    over_350_num = int(np.sum(cdr3_oligo_list['Length'] > 350))
     print(f'{over_350_num}/{cdr3_oligo_list.shape[0]} oligos ({round(100*over_350_num/cdr3_oligo_list.shape[0], 2)}%) are over 350 bp long.')
 
     poolA_under350 = cdr3_oligo_list.loc[np.logical_and(cdr3_oligo_list['Pool'] == 'A', cdr3_oligo_list['Length'] <= 350)].copy()
@@ -589,17 +944,12 @@ def generate_cdr3_oligos(input_csv_path, output_dir=None, clonotype_id_column=No
     all_under350 = cdr3_oligo_list.loc[cdr3_oligo_list['Length'] <= 350].copy()
     all_over350 = cdr3_oligo_list.loc[cdr3_oligo_list['Length'] > 350].copy()
 
-    # Rebuild the combined under-350 table after padding.
-    all_under350 = cdr3_oligo_list.loc[cdr3_oligo_list['Length'] <= 350].copy()
-
 
     #SAVE OUTPUTS
     print(f'Saving output files to {output_dir}')
-    try:
-        os.mkdir(output_dir)
-    except FileExistsError:
-        pass
-    
+    os.makedirs(output_dir, exist_ok=True)
+
+
     cdr3_oligo_list.to_csv(os.path.join(output_dir, f'All_{cdr3_oligo_list.shape[0]}_CDR3_oligos.csv'), index=False)
     invalid_cdr3_oligo_list.to_csv(os.path.join(output_dir, 'Invalid_CDR3_table.csv'), index=False)
     
@@ -612,11 +962,18 @@ def generate_cdr3_oligos(input_csv_path, output_dir=None, clonotype_id_column=No
     poolB_over350.to_csv(os.path.join(output_dir, 'Over350_PoolB_CDR3_oligos.csv'), index=False)
 
     # Pad each Pool A/B and Under/Over350 table independently.
-    _save_padded_tables(output_dir, random_sequence_file)
+    _save_padded_tables(output_dir, random_sequence_file, clonotype_column=clonotype_id_column)
 
     #save oligo pool metadata
     with open(os.path.join(output_dir, 'Oligo_Pool_Metadata.csv'), 'w') as out:
         out.write('Entry Name,Value\n')
+
+        out.write(f'Random Seed,{seed if seed is not None else "none (non-reproducible run)"}\n')
+        out.write(f'Clonotype Name Column,{clonotype_id_column}\n')
+        out.write(f'Clonotype Names: Suffixed To Stay Unique,{len(name_collisions)}\n')
+        out.write(f'Input TCRs: Unique After Deduplication,{tcr_list.shape[0]}\n')
+        out.write(f'Input TCRs: Duplicates Removed,{removed_num}\n')
+        out.write(f'Oligos: Failed To Generate,{invalid_cdr3_num}\n')
 
         out.write(f'Num Oligos: Pool A Under 350bp,{poolA_under350.shape[0]}\n')
         out.write(f'Num Oligos: Pool B Under 350bp,{poolB_under350.shape[0]}\n')
@@ -632,9 +989,13 @@ def run_CLI():
     parser = argparse.ArgumentParser(description='TCRAFT-generate: Generate CDR3 Oligos from TCR sequence annotation data.')
     parser.add_argument('input_csv_path', type=str, help='Input CSV file with TCR information. Must contain the following columns: V_alpha, V_beta, CDR3_alpha, CDR3_beta, J_alpha, J_beta')
     parser.add_argument('--output_dir', type=str, help='Directory to save output files. Default is ./TCRAFT-generate_<date>', default=None)
-    parser.add_argument('--clonotype_id_column', type=str, default=None, help='Optional input CSV column containing clonotype IDs.')
+    parser.add_argument('--clonotype_id_column', type=str, default=None, help=f'Input CSV column containing clonotype names. Auto-detected by default among: {", ".join(CLONOTYPE_CANDIDATE_COLUMNS)}. If the CSV holds none, names TCR_0001... are generated.')
+    parser.add_argument('--seed', type=int, default=DEFAULT_SEED, help=f'Random seed for codon sampling. The same seed and input CSV always yield the same oligos. Default is {DEFAULT_SEED}.')
+    parser.add_argument('--no_seed', action='store_true', help='Do not fix the random seed (non-reproducible run).')
     args = parser.parse_args()
-    generate_cdr3_oligos(args.input_csv_path, args.output_dir, args.clonotype_id_column, ref_dir.joinpath('random_1000nt.txt'))
+    generate_cdr3_oligos(args.input_csv_path, args.output_dir, args.clonotype_id_column,
+                         ref_dir.joinpath('random_1000nt.txt'),
+                         seed=None if args.no_seed else args.seed)
     
 if __name__ == "__main__":
     run_CLI()

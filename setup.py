@@ -6,17 +6,25 @@ def parse_requirements(filename):
 
 setup(
     name="TCRAFT",
-    version="1.1.0",
+    version="1.2.0",
     packages=find_packages(),
     include_package_data=True,
     package_data={
         "TCRAFT.references": ['*'],
     },
     install_requires=parse_requirements("requirements.txt"),
+    extras_require={
+        # pip install "TCRAFT[gui]" to get the graphical interface as well.
+        "gui": parse_requirements("requirements-gui.txt"),
+    },
     entry_points={
         "console_scripts": [
             "TCRAFT-generate=TCRAFT.Generate:run_CLI",
-            "TCRAFT-validate=TCRAFT.Validate:run_CLI"
+            "TCRAFT-validate=TCRAFT.Validate:run_CLI",
+        ],
+        # gui_scripts, not console_scripts: no console window opens on Windows.
+        "gui_scripts": [
+            "TCRAFT-gui=TCRAFT.gui.main:main",
         ],
     },
     author="Rachit Mukkamala",
@@ -27,5 +35,5 @@ setup(
         "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
     ],
-    python_requires=">=3.7",
+    python_requires=">=3.9",
 )
